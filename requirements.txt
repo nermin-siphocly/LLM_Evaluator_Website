@@ -1,0 +1,13 @@
+streamlit
+pandas
+matplotlib
+bert-score
+sentence-transformers
+torch
+gensim
+pot
+keybert
+scikit-learn
+yake
+numpy
+scipy

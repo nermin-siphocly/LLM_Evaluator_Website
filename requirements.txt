@@ -1,13 +1,13 @@
 streamlit
 pandas
 matplotlib
+numpy
+scikit-learn
+yake
 bert-score
 sentence-transformers
 torch
-gensim
+gensim==4.3.3
 pot
 keybert
-scikit-learn
-yake
-numpy
 scipy

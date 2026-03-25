@@ -123,7 +123,7 @@ def get_keyword_model(model_name: str):
 def clean_text_for_keywords(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9.;,!?/\|@&#$ \n]", "", text)
 
-
+@st.cache_data
 def extract_keywords_single_model(
     text: str,
     model_name: str,
@@ -147,7 +147,7 @@ def extract_keywords_single_model(
 
     return [keyword for keyword, score in keywords_with_scores]
 
-
+@st.cache_data
 def extract_keywords_combined_paper_mode(
     text: str,
     top_n: int = 10,

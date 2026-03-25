@@ -181,8 +181,7 @@ def extract_keywords_combined_paper_mode(
 # =========================
 @st.cache_resource
 def get_keyword_semantic_comparison_model():
-    # Faithful to the notebook:
-    # model = SentenceTransformer('all-MiniLM-L6-v2')
+    from sentence_transformers import SentenceTransformer
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 

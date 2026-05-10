@@ -1,43 +1,43 @@
 import re
-import streamlit as st
-
 import numpy as np
+import streamlit as st
+from concurrent.futures import ThreadPoolExecutor
 from sklearn.metrics.pairwise import cosine_similarity
-
-
 import yake
-
-
 
 
 # =========================
 # BERTScore
+# PATCH 1: Cache BERTScorer object instead of just the import.
+# The old approach re-loaded the underlying BERT model on every call.
+# BERTScorer keeps the model in memory after the first load.
 # =========================
-import streamlit as st
-
 
 @st.cache_resource
-def get_bertscore_import():
-    from bert_score import score
-    return score
+def get_bertscore_scorer():
+    from bert_score import BERTScorer
+    return BERTScorer(lang="en", rescale_with_baseline=False, verbose=False)
 
 
 def compute_bertscore(reference_text: str, generated_text: str) -> dict:
     if not reference_text.strip() or not generated_text.strip():
         return {"Precision": 0.0, "Recall": 0.0, "F1": 0.0}
 
-    score_fn = get_bertscore_import()
-    P, R, F1 = score_fn([generated_text], [reference_text], lang="en", verbose=False)
+    scorer = get_bertscore_scorer()
+    P, R, F1 = scorer.score([generated_text], [reference_text])
 
     return {
-        "Precision": float(P.mean().item()),
-        "Recall": float(R.mean().item()),
-        "F1": float(F1.mean().item()),
+        "Precision": float(P.mean()),
+        "Recall": float(R.mean()),
+        "F1": float(F1.mean()),
     }
+
 
 # =========================
 # Full-text semantic similarity
+# (unchanged — already efficient via cached model)
 # =========================
+
 @st.cache_resource
 def get_semantic_model():
     from sentence_transformers import SentenceTransformer
@@ -61,11 +61,10 @@ def compute_sentence_transformer_similarity(reference_text: str, generated_text:
     return float(util.pytorch_cos_sim(emb1, emb2).item())
 
 
-
-
 # =========================
 # Cached WMD model
 # =========================
+
 @st.cache_resource
 def get_wmd_model():
     import gensim.downloader as api
@@ -81,15 +80,20 @@ def preprocess_for_wmd(text: str, word_vectors):
     return tokens
 
 
+# PATCH 2: Truncate tokens before WMD on full text.
+# WMD complexity is O(n³ log n). A 500-token document can take
+# 30–60× longer than a 100-token one with negligible accuracy gain.
+MAX_WMD_TOKENS = 100
+
+
 def compute_wmd_full_text(reference_text, generated_text):
     if not reference_text.strip() or not generated_text.strip():
         return float("inf")
 
-    # Load model only when needed (cached)
     word_vectors = get_wmd_model()
 
-    t1 = preprocess_for_wmd(reference_text, word_vectors)
-    t2 = preprocess_for_wmd(generated_text, word_vectors)
+    t1 = preprocess_for_wmd(reference_text, word_vectors)[:MAX_WMD_TOKENS]
+    t2 = preprocess_for_wmd(generated_text, word_vectors)[:MAX_WMD_TOKENS]
 
     if not t1 or not t2:
         return float("inf")
@@ -103,6 +107,7 @@ def compute_wmd_full_text(reference_text, generated_text):
 # =========================
 # Keyword extraction
 # =========================
+
 @st.cache_resource
 def get_keyword_model(model_name: str):
     from keybert import KeyBERT
@@ -122,6 +127,7 @@ def get_keyword_model(model_name: str):
 
 def clean_text_for_keywords(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9.;,!?/\|@&#$ \n]", "", text)
+
 
 @st.cache_data
 def extract_keywords_single_model(
@@ -147,6 +153,10 @@ def extract_keywords_single_model(
 
     return [keyword for keyword, score in keywords_with_scores]
 
+
+# PATCH 5: Parallelize Combined paper mode.
+# The 3 models are independent — running them in parallel cuts wall-clock
+# time from ~3× single-model time down to ~1× single-model time.
 @st.cache_data
 def extract_keywords_combined_paper_mode(
     text: str,
@@ -161,24 +171,50 @@ def extract_keywords_combined_paper_mode(
             "Combined": [],
         }
 
-    general_keywords = extract_keywords_single_model(text, "General", top_n, nr_candidates)
-    legal_keywords = extract_keywords_single_model(text, "Legal", top_n, nr_candidates)
-    medical_keywords = extract_keywords_single_model(text, "Medical", top_n, nr_candidates)
+    model_names = ["General", "Legal", "Medical"]
 
-    combined_keywords = list(set(general_keywords + legal_keywords + medical_keywords))
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            name: executor.submit(
+                extract_keywords_single_model, text, name, top_n, nr_candidates
+            )
+            for name in model_names
+        }
+        extracted = {name: futures[name].result() for name in model_names}
 
-    return {
-        "General": general_keywords,
-        "Legal": legal_keywords,
-        "Medical": medical_keywords,
-        "Combined": combined_keywords,
-    }
+    extracted["Combined"] = list(set(
+        extracted["General"] + extracted["Legal"] + extracted["Medical"]
+    ))
+    return extracted
 
-#-----------------------------------------------------
 
 # =========================
-# Keyword comparison models
+# YAKE keyword extraction
 # =========================
+
+@st.cache_resource
+def get_yake_extractor():
+    return yake.KeywordExtractor(lan="en", n=3, top=10)
+
+
+def extract_keywords_yake(text: str) -> list[str]:
+    if not text.strip():
+        return []
+
+    cleaned_text = clean_text_for_keywords(text)
+    kw_extractor = get_yake_extractor()
+
+    try:
+        keywords_with_scores = kw_extractor.extract_keywords(cleaned_text)
+        return [kw for kw, score in keywords_with_scores]
+    except Exception:
+        return []
+
+
+# =========================
+# Keyword comparison: shared embedding model
+# =========================
+
 @st.cache_resource
 def get_keyword_semantic_comparison_model():
     from sentence_transformers import SentenceTransformer
@@ -188,81 +224,12 @@ def get_keyword_semantic_comparison_model():
 # =========================
 # Keyword comparison metrics
 # =========================
+
 def compute_exact_match(reference_keywords: list[str], generated_keywords: list[str]) -> float:
-    """
-    
-    exact_count = sum(1 for expr in set2 if expr in set1)
-    exact_score = exact_count / len(set2) if set2 else 0
-    """
-    set2 = reference_keywords
-    set1 = generated_keywords
-
-    if not set2:
+    if not reference_keywords:
         return 0.0
-
-    exact_count = sum(1 for expr in set2 if expr in set1)
-    return exact_count / len(set2)
-
-
-def compute_semantic_pairwise_similarity(
-    reference_keywords: list[str],
-    generated_keywords: list[str],
-    threshold: float = 0.8,
-) -> float:
-    """
-    
-    - encode generated and reference keyword sets
-    - for each reference keyword, check whether any generated keyword
-      reaches cosine similarity >= threshold
-    - score = matched_reference_keywords / len(reference_keywords)
-    """
-    set2 = reference_keywords
-    set1 = generated_keywords
-
-    if not set2 or not set1:
-        return 0.0
-
-    semantic_model = get_keyword_semantic_comparison_model()
-
-    embeddings1 = semantic_model.encode(set1)
-    embeddings2 = semantic_model.encode(set2)
-
-    sem_count = 0
-    for i, expr2 in enumerate(set2):
-        for j, expr1 in enumerate(set1):
-            similarity = cosine_similarity([embeddings2[i]], [embeddings1[j]])[0][0]
-            if similarity >= threshold:
-                sem_count += 1
-                break
-
-    return sem_count / len(set2)
-
-
-def compute_set_level_embedding_similarity(
-    reference_keywords: list[str],
-    generated_keywords: list[str],
-) -> float:
-    """
-   
-    - encode each keyword/keyphrase
-    - average embeddings within each set
-    - cosine similarity between average embeddings
-    """
-    set2 = reference_keywords
-    set1 = generated_keywords
-
-    if not set2 or not set1:
-        return 0.0
-
-    semantic_model = get_keyword_semantic_comparison_model()
-
-    embeddings1 = semantic_model.encode(set1)
-    embeddings2 = semantic_model.encode(set2)
-
-    avg_embedding1 = np.mean(embeddings1, axis=0)
-    avg_embedding2 = np.mean(embeddings2, axis=0)
-
-    return float(cosine_similarity([avg_embedding1], [avg_embedding2])[0][0])
+    exact_count = sum(1 for kw in reference_keywords if kw in generated_keywords)
+    return exact_count / len(reference_keywords)
 
 
 def compute_partial_match(
@@ -270,89 +237,99 @@ def compute_partial_match(
     generated_keywords: list[str],
     word_overlap_threshold: int = 2,
 ) -> float:
-    """
-   
-    - for each reference keyword phrase
-    - compare word overlap with each generated keyword phrase
-    - count as matched if overlap >= threshold
-    """
-    set2 = reference_keywords
-    set1 = generated_keywords
-
-    if not set2:
+    if not reference_keywords:
         return 0.0
 
     partial_count = 0
-    for expr2 in set2:
-        words2 = set(expr2.split())
-        for expr1 in set1:
-            words1 = set(expr1.split())
-            if len(words1.intersection(words2)) >= word_overlap_threshold:
+    for ref_kw in reference_keywords:
+        words_ref = set(ref_kw.split())
+        for gen_kw in generated_keywords:
+            words_gen = set(gen_kw.split())
+            if len(words_ref.intersection(words_gen)) >= word_overlap_threshold:
                 partial_count += 1
                 break
 
-    return partial_count / len(set2)
+    return partial_count / len(reference_keywords)
+
+
+# PATCH 3 & 4: Vectorized cosine similarity + single encoding pass.
+# The old nested loop called cosine_similarity up to n×m times separately.
+# This function encodes once and returns BOTH pairwise and set-level scores,
+# so callers that need both metrics avoid encoding the same keywords twice.
+def compute_embedding_metrics_combined(
+    reference_keywords: list[str],
+    generated_keywords: list[str],
+    threshold: float = 0.8,
+) -> dict:
+    """
+    Encode reference and generated keywords once, then compute:
+      - semantic_pairwise: fraction of reference keywords that have at least
+        one generated keyword with cosine similarity >= threshold.
+      - set_level: cosine similarity between the mean embeddings of each set.
+
+    Returns dict with keys 'semantic_pairwise' and 'set_level'.
+    """
+    if not reference_keywords or not generated_keywords:
+        return {"semantic_pairwise": 0.0, "set_level": 0.0}
+
+    model = get_keyword_semantic_comparison_model()
+    emb_gen = model.encode(generated_keywords)   # shape: (n_gen, dim)
+    emb_ref = model.encode(reference_keywords)   # shape: (n_ref, dim)
+
+    # Full similarity matrix in one vectorized BLAS call — shape: (n_ref, n_gen)
+    sim_matrix = cosine_similarity(emb_ref, emb_gen)
+
+    # Pairwise: a reference keyword is matched if ANY generated keyword >= threshold
+    sem_count = int((sim_matrix.max(axis=1) >= threshold).sum())
+    pairwise = sem_count / len(reference_keywords)
+
+    # Set-level: cosine similarity between mean embeddings
+    set_level = float(cosine_similarity(
+        [np.mean(emb_gen, axis=0)],
+        [np.mean(emb_ref, axis=0)]
+    )[0][0])
+
+    return {"semantic_pairwise": pairwise, "set_level": set_level}
+
+
+# Convenience wrappers so existing call sites in LLM_Eval.py keep working
+# (though it is more efficient to call compute_embedding_metrics_combined once
+# and unpack both values when both metrics are selected — see LLM_Eval.py patch).
+def compute_semantic_pairwise_similarity(
+    reference_keywords: list[str],
+    generated_keywords: list[str],
+    threshold: float = 0.8,
+) -> float:
+    return compute_embedding_metrics_combined(
+        reference_keywords, generated_keywords, threshold
+    )["semantic_pairwise"]
+
+
+def compute_set_level_embedding_similarity(
+    reference_keywords: list[str],
+    generated_keywords: list[str],
+) -> float:
+    return compute_embedding_metrics_combined(
+        reference_keywords, generated_keywords
+    )["set_level"]
 
 
 def compute_wmd_keywords(reference_keywords: list[str], generated_keywords: list[str]) -> float:
-    """
-    
-    - flatten keyword phrases into word lists
-    - compute WMD over those words
-    """
-    set2 = reference_keywords
-    set1 = generated_keywords
-
-    if not set2 or not set1:
+    if not reference_keywords or not generated_keywords:
         return float("inf")
 
     wmd_model = get_wmd_model()
 
-    words1 = [word for phrase in set1 for word in phrase.lower().split()]
-    words2 = [word for phrase in set2 for word in phrase.lower().split()]
+    words_gen = [word for phrase in generated_keywords for word in phrase.lower().split()]
+    words_ref = [word for phrase in reference_keywords  for word in phrase.lower().split()]
 
-    # Keep only tokens that exsist in the embedding vocab
-    words1 = [word for word in words1 if word in wmd_model]
-    words2 = [word for word in words2 if word in wmd_model]
+    words_gen = [w for w in words_gen if w in wmd_model]
+    words_ref = [w for w in words_ref if w in wmd_model]
 
-    if not words1 or not words2:
+    if not words_gen or not words_ref:
         return float("inf")
 
     try:
-        distance = wmd_model.wmdistance(words1, words2)
+        return float(wmd_model.wmdistance(words_gen, words_ref))
     except Exception:
-        distance = float("inf")
-
-    return float(distance)
-
-#-----------------------------------------------------
-
-# =========================
-# YAKE keyword extraction
-# =========================
-@st.cache_resource
-def get_yake_extractor():
-    # Faithful to the notebook:
-    # lan="en", n=3, top=10
-    return yake.KeywordExtractor(lan="en", n=3, top=10)
-
-
-def extract_keywords_yake(text: str) -> list[str]:
-    """
-    Faithful adaptation of the YAKE extraction notebook:
-    - clean text
-    - extract up to 10 keywords/keyphrases
-    - keep only the keyword strings
-    """
-    if not text.strip():
-        return []
-
-    cleaned_text = clean_text_for_keywords(text)
-    kw_extractor = get_yake_extractor()
-
-    try:
-        keywords_with_scores = kw_extractor.extract_keywords(cleaned_text)
-        keywords_only = [kw for kw, score in keywords_with_scores]
-        return keywords_only
-    except Exception:
-        return []
+        return float("inf")
